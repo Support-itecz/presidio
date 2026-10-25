@@ -97,6 +97,33 @@ class TestDeduplicateOverlappingEntities:
         assert text[result[0].start : result[0].end] == "John Smith"
         assert result[0].score == 0.88
 
+    def test_duplicate_prefers_prediction_not_cut_by_leading_chunk_edge(self):
+        """A partial match after leading whitespace in a chunk is an edge match."""
+        chunker = CharacterBasedTextChunker(chunk_size=41, chunk_overlap=6)
+        text = "The contact person for this case is John Smith from accounting dept."
+
+        def predict_func(chunk):
+            # The second chunk starts at " Smith", so it only sees the last name
+            if chunk.startswith(" Smith"):
+                return [
+                    RecognizerResult(entity_type="PERSON", start=1, end=6, score=0.9)
+                ]
+            if "John Smith" in chunk:
+                idx = chunk.index("John Smith")
+                return [
+                    RecognizerResult(
+                        entity_type="PERSON", start=idx, end=idx + 10, score=0.8
+                    )
+                ]
+            return []
+
+        assert [c.text for c in chunker.chunk(text)][1].startswith(" Smith")
+        result = chunker.predict_with_chunking(text, predict_func)
+
+        assert len(result) == 1
+        assert text[result[0].start : result[0].end] == "John Smith"
+        assert result[0].score == 0.8
+
     def test_lower_score_containing_span_does_not_replace_kept(self):
         """A low-score span containing the kept one must not take its place."""
         chunker = CharacterBasedTextChunker()
@@ -139,7 +166,8 @@ class TestDeduplicateOverlappingEntities:
         ]
 
         result = chunker.deduplicate_overlapping_entities(
-            predictions, at_chunk_edge=[True, False, False]
+            predictions,
+            at_chunk_edge=[(False, True), (False, False), (False, False)],
         )
 
         assert [(r.start, r.end, r.score) for r in result] == [

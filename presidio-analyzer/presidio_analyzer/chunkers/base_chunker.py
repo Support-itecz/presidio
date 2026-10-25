@@ -86,19 +86,19 @@ class BaseTextChunker(ABC):
         self,
         chunks: List[TextChunk],
         process_func: Callable[[str], List["RecognizerResult"]],
-    ) -> Tuple[List["RecognizerResult"], List[bool]]:
+    ) -> Tuple[List["RecognizerResult"], List[Tuple[bool, bool]]]:
         """Process text chunks and mark predictions cut by an inner chunk edge.
 
-        A prediction touches an inner edge when it starts at the start of any
-        chunk but the first, or ends at the end of any chunk but the last.
-        Such a prediction may be a partial entity that the neighbouring
-        chunk saw whole.
+        A prediction touches an inner edge when only whitespace separates it
+        from the start of any chunk but the first, or from the end of any
+        chunk but the last. Such a prediction may be a partial entity that
+        the neighbouring chunk saw whole.
 
         :param chunks: List of TextChunk objects with text and position information
         :param process_func: Function that takes chunk text and returns
             RecognizerResult objects
         :return: Tuple of the RecognizerResult list with adjusted offsets and
-            a parallel list of inner-edge flags
+            a parallel list of (start_at_edge, end_at_edge) flags
         """
         all_predictions = []
         at_chunk_edge = []
@@ -120,8 +120,10 @@ class BaseTextChunker(ABC):
                 )
                 all_predictions.append(adjusted_pred)
                 at_chunk_edge.append(
-                    (idx > 0 and pred.start == 0)
-                    or (idx < last and pred.end == len(chunk.text))
+                    (
+                        idx > 0 and not chunk.text[: pred.start].strip(),
+                        idx < last and not chunk.text[pred.end :].strip(),
+                    )
                 )
 
         return all_predictions, at_chunk_edge
@@ -130,26 +132,28 @@ class BaseTextChunker(ABC):
         self,
         predictions: List["RecognizerResult"],
         overlap_threshold: float = 0.5,
-        at_chunk_edge: Optional[List[bool]] = None,
+        at_chunk_edge: Optional[List[Tuple[bool, bool]]] = None,
     ) -> List["RecognizerResult"]:
         """Remove duplicate entities from overlapping chunks.
 
         The highest-scoring prediction is kept, unless it touches an inner
-        chunk edge and its only duplicate does not. The overlap guarantees the
-        neighbouring chunk saw that entity whole, so its prediction is kept
-        instead of the possibly partial one.
+        chunk edge and its only duplicate contains it and extends past that
+        edge without touching an edge on the same side. The overlap guarantees
+        the neighbouring chunk saw that entity whole, so its prediction is
+        kept instead of the possibly partial one.
 
         :param predictions: List of RecognizerResult objects
         :param overlap_threshold: Overlap ratio threshold to consider duplicates
             (default: 0.5)
-        :param at_chunk_edge: Optional list, parallel to predictions, flagging
-            predictions that touch an inner chunk edge (default: none do)
+        :param at_chunk_edge: Optional list, parallel to predictions, of
+            (start_at_edge, end_at_edge) flags marking predictions that touch
+            an inner chunk edge (default: none do)
         :return: Deduplicated list of RecognizerResult sorted by position
         """
         if not predictions:
             return predictions
         if at_chunk_edge is None:
-            at_chunk_edge = [False] * len(predictions)
+            at_chunk_edge = [(False, False)] * len(predictions)
 
         def is_duplicate(pred: "RecognizerResult", kept: "RecognizerResult") -> bool:
             # Check if same entity type and overlapping positions
@@ -170,6 +174,21 @@ class BaseTextChunker(ABC):
             # Check if overlap exceeds threshold
             return overlap_len / min(pred_len, kept_len) > overlap_threshold
 
+        def completes_cut(
+            pred: "RecognizerResult",
+            pred_edge: Tuple[bool, bool],
+            kept: "RecognizerResult",
+            kept_edge: Tuple[bool, bool],
+        ) -> bool:
+            # pred must contain kept and extend past a side where kept is cut
+            if pred.start > kept.start or pred.end < kept.end:
+                return False
+            extends_start = (
+                kept_edge[0] and not pred_edge[0] and pred.start < kept.start
+            )
+            extends_end = kept_edge[1] and not pred_edge[1] and pred.end > kept.end
+            return extends_start or extends_end
+
         # Sort by score descending to keep highest scoring entities
         order = sorted(
             range(len(predictions)), key=lambda i: predictions[i].score, reverse=True
@@ -185,15 +204,16 @@ class BaseTextChunker(ABC):
             if not duplicates:
                 unique.append(pred)
                 unique_at_edge.append(at_chunk_edge[idx])
-            elif (
-                len(duplicates) == 1
-                and unique_at_edge[duplicates[0]]
-                and not at_chunk_edge[idx]
+            elif len(duplicates) == 1 and completes_cut(
+                pred,
+                at_chunk_edge[idx],
+                unique[duplicates[0]],
+                unique_at_edge[duplicates[0]],
             ):
                 # The kept result may be cut by a chunk edge, prefer the
                 # prediction from the chunk that saw the entity whole
                 unique[duplicates[0]] = pred
-                unique_at_edge[duplicates[0]] = False
+                unique_at_edge[duplicates[0]] = at_chunk_edge[idx]
 
         # Sort by position for consistent output
         return sorted(unique, key=lambda p: p.start)
